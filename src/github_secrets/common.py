@@ -1,4 +1,9 @@
 """Validation and private runtime utilities. SPDX-License-Identifier: GPL-3.0-only."""
+import base64
+import hashlib
+from cryptography.exceptions import UnsupportedAlgorithm
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 import json
 import os
 import re
@@ -45,9 +50,18 @@ def sha(value):
 
 
 def recipient(value):
+    if isinstance(value, str) and value.startswith('ssh-rsa '):
+        try:
+            key = serialization.load_ssh_public_key(value.encode('ascii'))
+            require(isinstance(key, rsa.RSAPublicKey) and 2048 <= key.key_size <= 16384,
+                    'RSA recipients require a 2048–16384 bit key.', 2)
+            return key.public_bytes(serialization.Encoding.OpenSSH,
+                                    serialization.PublicFormat.OpenSSH).decode('ascii')
+        except (ValueError, UnicodeError, UnsupportedAlgorithm):
+            raise Error('Invalid SSH RSA recipient.', 2) from None
     # Native age X25519 uses Bech32 with a 32-byte payload and checksum.
     require(isinstance(value, str) and re.fullmatch(r'age1[023456789acdefghjklmnpqrstuvwxyz]{58}', value),
-            'Expected a complete native age X25519 recipient.', 2)
+            'Expected a complete age X25519 or SSH RSA recipient.', 2)
     alphabet = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'
     data = [alphabet.index(c) for c in value[4:]]
     expanded = [ord(c) >> 5 for c in 'age'] + [0] + [ord(c) & 31 for c in 'age']
@@ -65,10 +79,16 @@ def recipient(value):
 
 def recipients(values):
     require(isinstance(values, list) and 1 <= len(values) <= 100, 'Expected 1–100 recipients.')
-    for value in values:
-        recipient(value)
+    values = [recipient(value) for value in values]
     require(len(set(values)) == len(values), 'Duplicate recipient.')
     return sorted(values)
+
+
+def discovery_token(value):
+    value = recipient(value)
+    if value.startswith('ssh-rsa '):
+        return 'rsasha256' + hashlib.sha256(base64.b64decode(value.split()[1])).hexdigest()
+    return value
 
 
 def json_bytes(value):

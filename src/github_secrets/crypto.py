@@ -6,6 +6,9 @@ import os
 import stat
 import tempfile
 from pathlib import Path
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.exceptions import UnsupportedAlgorithm
 from .common import (Error, MAX_DOCUMENT, MAX_RECORD, child_env, fields, json_bytes,
                      parse_json, read_limited, recipient, recipients, require, run)
 from .inputs import hidden
@@ -62,6 +65,27 @@ class Identities:
                 raw = run(['ssh-to-age', '-private-key', '-stdinpass', '-i', str(path)],
                           (passphrase + '\n').encode())
             # Conversion must produce native keys, never a direct SSH stanza.
+        elif source['type'] == 'ssh-rsa':
+            loader = (serialization.load_ssh_private_key if raw.startswith(b'-----BEGIN OPENSSH')
+                      else serialization.load_pem_private_key)
+            try:
+                try:
+                    key = loader(raw, password=None)
+                except TypeError:
+                    key = loader(raw, password=hidden('SSH private key passphrase: ').encode())
+                require(isinstance(key, rsa.RSAPrivateKey), 'Expected an RSA private key.', 2)
+                public = recipient(key.public_key().public_bytes(
+                    serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH).decode())
+                pubfile = path.with_name(path.name + '.pub')
+                if pubfile.exists():
+                    require(recipient(read_limited(pubfile, MAX_RECORD).decode().strip()) == public,
+                            'SSH public file does not match private identity.')
+                private = key.private_bytes(serialization.Encoding.PEM,
+                                            serialization.PrivateFormat.TraditionalOpenSSL,
+                                            serialization.NoEncryption()).decode()
+                return [(public, private)]
+            except (ValueError, TypeError, UnicodeError, UnsupportedAlgorithm):
+                raise Error('Cannot unlock or parse RSA identity; check its format and passphrase.') from None
         elif source['type'] != 'age':
             raise Error('Unsupported identity type.', 2)
         try:
@@ -70,7 +94,7 @@ class Identities:
         except UnicodeError:
             raise Error('Invalid identity file.') from None
         require(keys and all(key.startswith('AGE-SECRET-KEY-1') for key in keys),
-                'Only Ed25519-derived or native X25519 identities are supported.')
+                'Expected a native age X25519 identity.')
         pairs = []
         for key in keys:
             pub = run(['age-keygen', '-y'], (key + '\n').encode()).decode().strip()
@@ -82,8 +106,12 @@ class Identities:
 
     def load(self):
         if self._keys is None:
-            sources = self.config.data['identities'] or [
-                {'path': str(Path.home() / '.ssh/id_ed25519'), 'type': 'ssh-ed25519'}]
+            sources = self.config.data['identities']
+            if not sources:
+                ed = Path.home() / '.ssh/id_ed25519'
+                # A present but invalid preferred key must not silently change identity.
+                sources = [{'path': str(ed), 'type': 'ssh-ed25519'}] if ed.exists() or ed.is_symlink() else [
+                    {'path': str(Path.home() / '.ssh/id_rsa'), 'type': 'ssh-rsa'}]
             self._keys = dict(pair for source in sources for pair in self.load_source(source))
             self.public = sorted(self._keys)
         return self
@@ -102,18 +130,29 @@ class Identities:
         self.load()
         selected = [only] if only else self.public
         require(all(key in self._keys for key in selected), 'Requested identity is unavailable.')
+        rsa_keys = [key for key in selected if key.startswith('ssh-rsa ')]
+        require(len(rsa_keys) <= 1, 'Select one RSA identity for this SOPS invocation.')
         # SOPS reopens the key file for each recipient, so it must be seekable.
         # Use a private, short-lived runtime file; never configuration or cache state.
         with tempfile.TemporaryDirectory(prefix='secrets-runtime-') as directory:
             keyfile = Path(directory) / 'keys.txt'
             fd = os.open(keyfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, 'w') as stream:
-                stream.write('\n'.join(self._keys[key] for key in selected) + '\n')
-            env = child_env({'SOPS_AGE_KEY_FILE': str(keyfile), 'XDG_CONFIG_HOME': directory})
+                stream.write('\n'.join(self._keys[key] for key in selected if key.startswith('age1')) + '\n')
+            sshfile = Path(directory) / 'ssh-key'
+            fd = os.open(sshfile, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'w') as stream:
+                stream.write(self._keys[rsa_keys[0]] if rsa_keys else '')
+            # SOPS also probes default SSH paths regardless of explicit key settings.
+            # Give this child process an empty home to enforce identity selection.
+            env = child_env({'SOPS_AGE_KEY_FILE': str(keyfile),
+                             'SOPS_AGE_SSH_PRIVATE_KEY_FILE': str(sshfile),
+                             'HOME': directory, 'XDG_CONFIG_HOME': directory})
             try:
                 yield env
             finally:
                 keyfile.unlink(missing_ok=True)
+                sshfile.unlink(missing_ok=True)
 
 
 
@@ -153,11 +192,20 @@ class Crypto:
 
     def decrypt(self, raw, policy, only=None):
         self.validate_ciphertext(raw, policy['recipients'])
-        with self.identities.key_env(only) as env:
-            result = run(['sops', '--config', '/dev/null', 'decrypt', '--input-type', 'json', '--output-type', 'json', '/dev/stdin'], raw, env)
-        payload = parse_json(result)
-        payload_value(payload, policy['name'])
-        return payload
+        self.identities.load()
+        candidates = [only] if only else [key for key in self.identities.public if key in policy['recipients']]
+        for candidate in candidates:
+            require(candidate in policy['recipients'], 'Selected identity is not a recipient.')
+            try:
+                with self.identities.key_env(candidate) as env:
+                    result = run(['sops', '--config', '/dev/null', 'decrypt', '--input-type', 'json',
+                                  '--output-type', 'json', '/dev/stdin'], raw, env)
+            except Error:
+                continue
+            payload = parse_json(result)
+            payload_value(payload, policy['name'])
+            return payload
+        raise Error('No selected identity could decrypt this secret.')
 
     def encrypt(self, payload, policy):
         # Fresh encryption generates a new data key on every mutation, including removal.

@@ -4,7 +4,7 @@ import binascii
 import copy
 import datetime as dt
 import uuid
-from .common import Error, MAX_VALUE, fields, name, recipients, recipient, require
+from .common import Error, MAX_VALUE, fields, discovery_token, name, recipients, recipient, require
 
 MARKER = {'format': 'github-sops-vault', 'version': 1}
 REMOVAL_WARNING = (
@@ -36,16 +36,29 @@ def validate_id(value):
 
 
 def policy(secret_name, audience):
-    return {'format': 'github-sops-secret', 'version': 1, 'name': name(secret_name),
-            'recipients': recipients(audience)}
+    audience = recipients(audience)
+    result = {'format': 'github-sops-secret', 'version': 1, 'name': name(secret_name),
+              'recipients': audience}
+    if any(key.startswith('ssh-rsa ') for key in audience):
+        result.update(version=2, search_tokens=sorted(discovery_token(key) for key in audience))
+    return result
 
 
 def validate_policy(obj, secret_name):
-    fields(obj, ('format', 'version', 'name', 'recipients'))
-    require(obj['format'] == 'github-sops-secret' and type(obj['version']) is int and obj['version'] == 1,
+    require(isinstance(obj, dict), 'Invalid recipient record.')
+    version = obj.get('version')
+    fields(obj, ('format', 'version', 'name', 'recipients', 'search_tokens') if version == 2
+           else ('format', 'version', 'name', 'recipients'))
+    require(obj['format'] == 'github-sops-secret' and type(version) is int and version in (1, 2),
             'Unsupported secret format.')
     require(obj['name'] == name(secret_name), 'Secret name does not match directory.')
-    recipients(obj['recipients'])
+    audience = recipients(obj['recipients'])
+    require(all(recipient(key) == key for key in obj['recipients']), 'Noncanonical recipient.')
+    if version == 1:
+        require(all(key.startswith('age1') for key in audience), 'RSA requires a version 2 record.')
+    else:
+        require(obj['search_tokens'] == sorted(discovery_token(key) for key in audience),
+                'Search tokens do not match recipient keys.')
     return obj
 
 

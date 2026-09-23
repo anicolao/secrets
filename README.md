@@ -6,7 +6,7 @@ A command-line secrets manager built from Nix flakes, SOPS, age, and GitHub. Eac
 
 ## The idea
 
-By default, the application uses your existing `~/.ssh/id_ed25519` private key as its identity source. It derives a stable native `age1…` public recipient, which you share with others and search for on GitHub. Each secret has its own explicit recipient list; its value is encrypted for those recipients before publication.
+By default, the application uses `~/.ssh/id_ed25519`, or `~/.ssh/id_rsa` if the Ed25519 key is absent. Ed25519 derives a stable native `age1…` address; RSA uses its full `ssh-rsa …` public key for encryption and a compact fingerprint token for GitHub discovery. `identity show` displays the public recipients and their search tokens. Each secret has its own explicit recipient list; its value is encrypted for those recipients before publication.
 
 In age terminology, a **recipient** is public and an **identity** is private. Only recipients belong in a vault repository; identities never do. See the [age manual](https://github.com/FiloSottile/age/blob/main/doc/age.1.ronn).
 
@@ -14,13 +14,13 @@ Per-secret recipients are part of version 1. A single vault can contain a person
 
 ## Getting started
 
-Prerequisites are Nix with flakes enabled, a GitHub account authenticated through `gh`, and an existing local Ed25519 SSH private key (or an explicitly configured native age identity). The flake supplies the application's runtime tools. You retain responsibility for backing up your identity; GitHub login cannot recover it.
+Prerequisites are Nix with flakes enabled, a GitHub account authenticated through `gh`, and an existing local Ed25519 or RSA SSH private key (or an explicitly configured native age identity). The flake supplies the application's runtime tools. You retain responsibility for backing up your identity; GitHub login cannot recover it.
 
 ```sh
 # Authenticate once if you have not already configured gh.
 nix develop --command gh auth login
 
-# Uses ~/.ssh/id_ed25519 automatically; no separate age key setup required.
+# Uses ~/.ssh/id_ed25519, falling back to ~/.ssh/id_rsa; no separate age key setup required.
 nix run . -- identity show
 
 # Create a GitHub repository; the first vault becomes the local default.
@@ -101,7 +101,7 @@ The default vault is a local preference, never a search result chosen implicitly
 vault.json                  # Vault format marker; no vault-wide recipient policy
 secrets/
   API_TOKEN/
-    recipients.json         # Small searchable record with complete age1… recipients
+    recipients.json         # Small searchable record with complete public keys and RSA search tokens
     value.sops.json          # Value encrypted only for this secret’s recipients
   SERVICE_CONFIG/
     recipients.json
@@ -115,9 +115,9 @@ Each `recipients.json` is searchable metadata and the intended policy for its si
 
 ## Discovery and listing
 
-`secrets list` searches GitHub for your full `age1…` recipient in `recipients.json` files, validates each matching secret at the current default-branch revision, and lists the names it can decrypt. It also scans known vaults, so you can use a repository before search indexes it. `vaults list` groups these addressed secrets by repository; registered empty vaults are shown separately as known containers. Neither command prints secret values.
+`secrets list` searches GitHub for your full `age1…` recipient or RSA fingerprint token in `recipients.json` files, validates each matching secret at the current default-branch revision, and lists the names it can decrypt. It also scans known vaults, so you can use a repository before search indexes it. `vaults list` groups these addressed secrets by repository; registered empty vaults are shown separately as known containers. Neither command prints secret values.
 
-You can also search GitHub manually for `"YOUR_COMPLETE_AGE_RECIPIENT" filename:recipients.json`. Obtain that public address with `nix run . -- identity show`. A match points directly to a secret’s recipient record, even when its ciphertext is too large for code search.
+You can also search GitHub manually for `"YOUR_SEARCH_TOKEN" filename:recipients.json`. Obtain that token with `nix run . -- identity show`. A match points directly to a secret’s recipient record, even when its ciphertext is too large for code search.
 
 Discovery is best effort. GitHub indexes the default branch, applies search limits, and can return incomplete results. Private results depend on the authenticated account's repository access. See [GitHub's search API documentation](https://docs.github.com/en/rest/search/search#search-code). The CLI must report partial results and failures rather than treating them as an empty inventory. Explicit registration with `vaults add` is the reliable fallback for a known repository.
 
@@ -125,9 +125,15 @@ The promise is “find and verify accessible secrets in known and discoverable v
 
 ## SSH identity default
 
-The application uses [ssh-to-age](https://github.com/Mic92/ssh-to-age) to convert Ed25519 SSH keys to native age keys. It derives the private identity only at runtime, without persisting a separate age key. This is distinct from encrypting directly to an `ssh-ed25519 …` recipient; this format consistently publishes the derived `age1…` address.
+The application uses [ssh-to-age](https://github.com/Mic92/ssh-to-age) to convert Ed25519 SSH keys to native age keys. It derives the private identity only at runtime, without persisting a separate age key. This is distinct from encrypting directly to an `ssh-ed25519 …` recipient; Ed25519 continues to publish the derived `age1…` address, preserving existing vault compatibility.
 
-Use `identity add PATH --type ssh-ed25519` for another SSH key path, or `identity add PATH --type age` for native age identities. Passphrase-protected SSH keys prompt privately when needed. RSA, ECDSA, and agent-only or hardware-held SSH keys are outside the initial conversion path and produce a clear unsupported-key error. SSH authentication key replacement does not migrate encrypted secrets: retain the old key until affected secrets have been rekeyed.
+Use `identity add PATH --type ssh-ed25519` or `identity add PATH --type ssh-rsa` for another SSH private key path, or `identity add PATH --type age` for native age identities. Explicit registrations override automatic selection. When both default SSH keys exist, Ed25519 wins; an invalid existing Ed25519 key raises an error instead of silently changing identity. A `.pub` file alone cannot decrypt.
+
+RSA keys from 2048 through 16384 bits are accepted in OpenSSH, PKCS#1 PEM, or PKCS#8 PEM format. Passphrase-protected SSH keys prompt privately when needed. RSA unlock uses the Python cryptography library; passphrases never enter child arguments or environment variables. ECDSA and agent-only or hardware-held keys remain unsupported.
+
+RSA public recipients are longer than GitHub's query limit, so records containing RSA use secret format version 2 and publish `rsasha256` followed by the lowercase SHA-256 hex digest of the decoded SSH public-key blob. The full canonical public key remains the encryption policy; a fingerprint hit is only a discovery hint and is checked against the full key and SOPS ciphertext. `identity show` includes a `search_tokens` mapping. Native-only records retain version 1; older clients reject version 2. The vault marker and encrypted payload schemas remain version 1.
+
+To share with RSA, pass the complete **public** key as one quoted recipient, for example `--recipient "$(cat bob_rsa.pub)"`. Public-key comments are stripped. RSA and native age recipients can share the same secret. RSA adds larger recipient records and key stanzas, fingerprint-based search, and another key-loading dependency; existing Ed25519 addresses do not change. SSH authentication key replacement does not migrate encrypted secrets: retain the old key until affected secrets have been rekeyed.
 
 ## Boundaries
 
@@ -176,6 +182,6 @@ Dotenv import supports single-line assignments, optional `export`, blank lines, 
 
 Secret values are limited to 1 MiB, encrypted documents to 4 MiB, recipient records to 64 KiB/100 recipients, and vaults to 1,000 secrets and 128 MiB of managed files. Encrypted snapshots are cached; `--offline` reads only available cached files and reports the revision and last check time. Online failures never silently fall back to stale data.
 
-Derived identities use mode-0600 files inside private temporary runtime directories because SOPS may reopen the identity for each recipient. Normal completion, errors, and handled termination remove them. A forced kill or host crash can leave a temporary file behind; the source SSH key’s passphrase does not protect such a leftover derived identity. No derived identity is written to configuration, Git, the Nix store, or the persistent cache.
+Derived age identities and temporarily unlocked RSA keys use mode-0600 files inside private temporary runtime directories because SOPS may reopen the identity for each recipient. Normal completion, errors, and handled termination remove them. A forced kill or host crash can leave a temporary file behind; the source SSH key’s passphrase does not protect such a leftover derived identity. No derived identity is written to configuration, Git, the Nix store, or the persistent cache.
 
 Exit codes are `0` for a completed operation, `1` for operational failure, `2` for invalid input/configuration, and `3` for partial listings. Successful removal still prints its security warning. Machine-readable listings use `--json`; secret values are emitted only by `get`.

@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 from .common import (Error, MAX_CACHE_BYTES, MAX_DOCUMENT, MAX_RECORD, MAX_SECRETS,
-                     atomic_write, child_env, json_bytes, name, parse_json, private_dir,
+                     atomic_write, child_env, discovery_token, json_bytes, name, parse_json, private_dir,
                      read_limited, repo_name, require, run, sha)
 from .model import MARKER, now
 
@@ -74,7 +74,7 @@ class GitHub:
         found, problems = {}, []
         for key in public:
             for page in range(1, 11):
-                query = quote(key + ' in:file filename:recipients.json', safe='')
+                query = quote(discovery_token(key) + ' in:file filename:recipients.json', safe='')
                 try:
                     result = self.api(f'search/code?q={query}&per_page=100&page={page}')
                     if result.get('incomplete_results') or result.get('total_count', 0) > 1000:

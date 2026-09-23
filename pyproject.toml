@@ -7,6 +7,7 @@ name = "github-secrets"
 version = "0.1.0"
 description = "Per-secret sharing and discovery with SOPS, age, and GitHub"
 requires-python = ">=3.9"
+dependencies = ["cryptography[ssh]>=41"]
 license = "GPL-3.0-only"
 license-files = ["LICENSE"]
 

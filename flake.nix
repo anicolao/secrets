@@ -18,12 +18,13 @@
             pyproject = true;
             src = self;
             build-system = [ pkgs.python3Packages.setuptools ];
+            dependencies = [ pkgs.python3Packages.cryptography pkgs.python3Packages.bcrypt ];
             nativeBuildInputs = [ pkgs.makeWrapper ];
             nativeCheckInputs = runtime;
             pythonImportsCheck = [ "github_secrets" ];
             checkPhase = ''
               runHook preCheck
-              PYTHONPATH=src python -m unittest discover -s tests -v
+              PYTHONPATH="$PWD/src:$PYTHONPATH" python -m unittest discover -s tests -v
               runHook postCheck
             '';
             postFixup = ''
@@ -44,7 +45,7 @@
       checks = eachSystem (system: { default = (forSystem system).app; });
       devShells = eachSystem (system:
         let env = forSystem system; in {
-          default = env.pkgs.mkShell { packages = env.runtime ++ [ env.pkgs.python3 ]; };
+          default = env.pkgs.mkShell { packages = env.runtime ++ [ (env.pkgs.python3.withPackages (ps: [ ps.cryptography ps.bcrypt ])) ]; };
         });
     };
 }

@@ -10,7 +10,7 @@ This document describes the implemented MVP contract and its verification criter
 | Hosting | One GitHub.com repository per vault |
 | Creation | Private by default; explicit `--public` |
 | Authorization unit | Independent explicit recipient set for each secret |
-| Key types | Native age X25519 recipients, derived by default from the existing Ed25519 SSH key |
+| Key types | Native age X25519 (including Ed25519-derived) and direct SSH RSA recipients |
 | Storage | One searchable recipient record and one SOPS JSON document per secret |
 | Discovery | Search full age recipients in per-secret records; supplement with known vaults |
 | Verification | Current manifest validation followed by actual decryption |
@@ -19,7 +19,7 @@ This document describes the implemented MVP contract and its verification criter
 | Implementation | Small Python CLI orchestrating packaged `sops`, `age`, `ssh-to-age`, OpenSSH tools, `git`, and `gh` |
 | Platforms | Initial targets: `aarch64-darwin`, `x86_64-darwin`, `aarch64-linux`, `x86_64-linux` |
 
-The default identity source is `~/.ssh/id_ed25519`; derive a native age recipient and identity with pinned `ssh-to-age`. Explicit native age identity files are also supported. Native identity files containing multiple keys require `identity default` to select self; do not silently choose a key from an ambiguous source. This format uses native `age1…` recipients consistently, not direct SSH recipient stanzas. RSA, ECDSA, hardware/agent-only SSH keys, other age types, plugins, and threshold groups are outside version 1. Validate conversion and SOPS interoperability against pinned versions before release.
+The default identity source is `~/.ssh/id_ed25519`; derive a native age recipient and identity with pinned `ssh-to-age`. If absent, use `~/.ssh/id_rsa` as a direct SSH RSA identity. RSA cannot be converted to a native X25519 address. Explicit native age identity files remain supported. Multiple keys require `identity default` to select self. ECDSA, hardware/agent-only keys, other age types, plugins, and threshold groups remain outside the MVP.
 
 ## Command contract
 
@@ -42,7 +42,7 @@ All examples use `nix run . -- …` from the application repository. The argumen
 | `recipients add NAME RECIPIENT [--vault OWNER/REPO]` | Grant access to this secret and its subsequent replacements |
 | `recipients remove NAME RECIPIENT [--vault OWNER/REPO]` | Remove a recipient from current encryption, record the event, rotate the data key, and warn that copies remain usable |
 
-These are the complete required commands for version 1. Deleting secrets, renaming them, and automatic private-key generation can follow later. The existing default SSH key is used without registration; no key is generated silently. Identity registration accepts `--type ssh-ed25519` or `--type age`.
+These are the complete required commands for version 1. Deleting secrets, renaming them, and automatic private-key generation can follow later. The existing default SSH key is used without registration; no key is generated silently. Identity registration accepts `--type ssh-ed25519`, `--type ssh-rsa`, or `--type age`.
 
 For `add`, `--stdin`, `--file`, and `--from-env` are mutually exclusive. With neither, prompt on a terminal with echo disabled; fail on a noninteractive invocation rather than hang. Prompted values are UTF-8 text. File and stdin input are arbitrary bytes, including empty values and trailing newlines. There is no positional value or `--value` option. `--from-env VARIABLE_NAME` reads an existing variable within the process; unset is an error and empty is a valid value. Remove this variable from child-process environments. Reject extra arguments before any mutation or network call, and never include rejected tokens in errors, telemetry, or debug logs. Parser failures must use generic messages because the extra argument may be a secret. The application cannot erase an argument from the invoking shell’s history, so documentation must not teach that input pattern. Stdin examples use file redirection or a producer, never shell literals containing secret values.
 
@@ -90,9 +90,13 @@ Each `secrets/<NAME>/recipients.json` is the public policy and discovery record 
 }
 ```
 
-The strings above are schematic placeholders. Real records contain canonical full `age1…` strings, one per line. Reject unknown fields, duplicate JSON keys, duplicate recipients, empty sets, unsupported versions, malformed keys, private identity material, and disagreement between `name` and directory. Sort recipients when writing. Limit each record to 64 KiB and 100 recipients. The root marker is also limited to 64 KiB. No record may redirect a client to another path or repository.
+The strings above are schematic placeholders. Version 1 records contain canonical full `age1…` strings, one per line. Reject unknown fields, duplicate JSON keys, duplicate recipients, empty sets, unsupported versions, malformed keys, private identity material, and disagreement between `name` and directory. Sort recipients when writing. Limit each record to 64 KiB and 100 recipients. The root marker is also limited to 64 KiB. No record may redirect a client to another path or repository.
 
 Each secret uses its own fresh SOPS data key. Its ciphertext recipient metadata must exactly match its sibling record. Do not share data keys between secrets, even if their audiences happen to match. This separation allows different audiences in one vault and makes changing one secret independent of every other secret.
+
+A secret with any RSA recipient uses record **version 2**, adding a required `search_tokens` array. Keep full canonical RSA and age keys in `recipients`. For each native age key the token is the key itself. For RSA the token is `rsasha256` plus the 64 lowercase hex characters of SHA-256 over the base64-decoded SSH public-key blob (not its textual representation or comment). Sort tokens and recipients on writing. Recompute tokens and require exact agreement while reading; full recipient membership and ciphertext agreement remain mandatory. Reject version-1 records containing RSA. Native-only writes retain version 1, including after the last RSA recipient is removed; encrypted removal history is preserved. Older clients reject version 2 rather than silently accepting it. The root marker and encrypted payload remain version 1.
+
+RSA keys exceed the [GitHub search query length limit](https://docs.github.com/en/rest/search/search#limitations-on-query-length); 73-character RSA tokens keep queries small. This adds public metadata and correlation, not a new authorization mechanism. `identity show` returns a `search_tokens` object mapping each complete public recipient to its token.
 
 There is no committed `.sops.yaml` in version 1. The wrapper supplies explicit per-secret recipients with an empty SOPS configuration. Every mutation performs fresh encryption with a new data key, including recipient additions and removals. Ignore ambient SOPS recipient settings and inherited configuration. Reject non-age backends, threshold groups, and unencrypted payload exceptions. Recipient records are policy declarations, not proof of access or publisher authenticity; verify the paired ciphertext before reporting a readable secret.
 
@@ -132,9 +136,13 @@ Use `$XDG_CONFIG_HOME/secrets/config.json` (fallback `~/.config/secrets/config.j
 
 Create application directories with mode `0700` and configuration/state files with mode `0600`. Identity registration records an absolute path and public recipients; it does not copy the key into configuration. Reject group/world-readable private key files and explain how to fix their permissions. Backups remain the user's responsibility.
 
-Identity resolution is deterministic: explicit registered configuration takes precedence; with none, use only `~/.ssh/id_ed25519`. Do not scan other keys or silently fall back to RSA. A missing default key gives setup guidance. Support multiple explicitly registered sources and query all their derived public recipients; select one as self for new secrets.
+Identity resolution is deterministic: explicit registered configuration takes precedence; with none, prefer `~/.ssh/id_ed25519` and use `~/.ssh/id_rsa` only when Ed25519 is absent. A present but invalid or unreadable preferred key fails rather than selecting a different identity. Support multiple explicitly registered sources; query every public recipient and select one as self for new secrets.
 
 Use [ssh-to-age](https://github.com/Mic92/ssh-to-age) to derive native age keys from Ed25519 SSH material. Its public conversion allows a stable `age1…` address; private conversion supports encrypted SSH keys with passphrase input via stdin. The client prompts privately when unlocking is required and passes the passphrase through a dedicated pipe, never an argument or environment variable. Unsupported key encryption formats produce an actionable error; the application never rewrites the SSH key.
+
+RSA uses canonical `ssh-rsa BASE64` public recipients with comments stripped, accepting 2048–16384-bit keys. Python cryptography with its SSH/bcrypt dependency loads OpenSSH, PKCS#1 PEM, and PKCS#8 PEM private keys. Unlock encrypted keys with a hidden prompt in-process, never a passphrase argument or environment variable. Verify any adjacent public file matches the private key. Do not rewrite the user's source key.
+
+Give SOPS a mode-0600 temporary RSA PEM file via `SOPS_AGE_SSH_PRIVATE_KEY_FILE`. Its child process gets an isolated temporary home and configuration directory so SOPS cannot load unrelated default SSH identities. For decryption, try matching registered identities individually; this supports multiple RSA sources and enforces explicit acting-identity selection. Clean up runtime keys on normal completion and handled failures, with the same forced-termination limits as derived age keys.
 
 Derive public material from the private key when establishing a source, checking any `.pub` file against it. Verify the public/private binding on each invocation; do not trust an unrelated `.pub` file. The current implementation unlocks identities before searching and does not persist derived public-key caches. Identity selection changes never automatically rekey existing secrets.
 
@@ -232,13 +240,13 @@ For example: a value reported generated at 09:00 and a recipient removed at 10:0
 The implementation uses authenticated GitHub REST code search through `gh api`. Its query is conceptually:
 
 ```text
-<complete-public-age-recipient> in:file filename:recipients.json
+<complete-native-age-recipient-or-rsa-search-token> in:file filename:recipients.json
 ```
 
 URL-encode the query through API parameters; do not interpolate it into a shell command. The exact supported query and indexing behavior must be exercised against GitHub before release, rather than inferred from the web search interface.
 
-1. Resolve the default SSH identity or explicit sources and derive/deduplicate their native age recipients. `identity show` exposes these public addresses for manual GitHub searches too.
-2. Search separately for each complete age recipient in `recipients.json`, following pagination and rate-limit headers. Search is automatic; users need not know repository URLs. Retain diagnostics for incomplete or capped searches.
+1. Resolve the default SSH identity or explicit sources and derive/deduplicate their public recipients. `identity show` exposes their search tokens for manual GitHub searches too.
+2. Search separately for each native age recipient or RSA fingerprint token in `recipients.json`, following pagination and rate-limit headers. Search is automatic; users need not know repository URLs. Retain diagnostics for incomplete or capped searches.
 3. Merge hits with recipient records enumerated from explicitly registered, previously discovered, and newly created vaults. Inspect only bounded paths matching `secrets/<NAME>/recipients.json`.
 4. Deduplicate by repository ID and secret path, not merely by repository. Fetch each repository’s current default-branch commit, then its root marker, recipient records, and target ciphertext at that same revision. Do not rely on search snippets or older indexed policy.
 5. Validate each record and exact membership of a local recipient. A secret addressed only to others is excluded normally, not reported as a decryption failure. Reject malformed candidates; report failures in known vaults and diagnostics for rejected search hits.
@@ -282,7 +290,7 @@ Encryption integrity does not establish author identity or prevent GitHub from s
 Use throwaway keys and fake values in every automated test. The suite exercises real local cryptographic tools and simulated GitHub state; the opt-in live smoke test uses an isolated non-default branch, so default-branch indexing and private-repository access remain separate deployment checks.
 
 1. **Format and local round trip:** validate manifests and names; encrypt/decrypt exact bytes including empty, multiline, binary, and maximum-size inputs. Confirm independent stock SOPS recovery and rejection of a nonrecipient identity.
-2. **CLI and packaging:** build on the target systems; exercise automatic SSH identity selection, alternate paths, native age sources, encrypted SSH keys, missing keys, unsupported types, stale `.pub` files, and repeatable public/private conversion. Confirm no persistent derived private key or build-time secret. Reject positional values, value flags, conflicting input modes, and noninteractive prompts without echoing rejected tokens or touching the network.
+2. **CLI and packaging:** build on the target systems; exercise Ed25519 preference and RSA fallback, alternate paths, native age sources, encrypted OpenSSH and PEM RSA keys, mixed RSA/age audiences, multiple RSA sources, fingerprint validation, missing keys, unsupported types, stale `.pub` files, and repeatable public/private conversion. Confirm no persistent derived private key or build-time secret. Reject positional values, value flags, conflicting input modes, and noninteractive prompts without echoing rejected tokens or touching the network.
 3. **Publishing:** exercise creation, addition, replacement, failed push recovery, unknown push outcomes, and concurrent writers using disposable repositories or local Git fixtures. Assert that only approved ciphertext/metadata paths are committed.
 4. **Per-secret sharing:** place Alice-only, Alice/Bob, and Alice/Carol secrets in one vault. Assert Bob discovers and decrypts only his addressed secret, and can update it with GitHub write permission despite lacking other decryption keys. Add/remove a recipient on one secret; verify other files are unchanged, new-revision exclusion works, and old-revision access persists. Verify that policy and ciphertext publish atomically.
 5. **Discovery:** test duplicate results, stale hits, unrelated files, malformed candidates, inaccessible private vaults, pagination, rate limits, and partial success with recorded API fixtures. Exercise explicit registration without search.

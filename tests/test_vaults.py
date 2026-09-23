@@ -5,7 +5,7 @@ import json
 import unittest
 from unittest.mock import patch
 from github_secrets.cli import App, parser
-from github_secrets.common import Error, json_bytes
+from github_secrets.common import run, Error, json_bytes
 from github_secrets.github import GitHub, Snapshot
 from github_secrets.model import lifecycle_status
 from support import FakeGitHub, Sandbox
@@ -246,7 +246,7 @@ class DiscoveryTests(unittest.TestCase):
             {'path': 'secrets/OTHER/recipients.json', 'repository': {'id': 1, 'full_name': 'a/b'}},
             {'path': 'other/recipients.json', 'repository': {'id': 2, 'full_name': 'a/c'}}]}
         with patch.object(gh, 'api', return_value=response) as api:
-            repos, errors = gh.search(['age1example'])
+            repos, errors = gh.search([run(['age-keygen', '-y'], run(['age-keygen'])).decode().strip()])
         self.assertEqual(repos, ['a/b'])
         self.assertTrue(errors)
         self.assertIn('filename%3Arecipients.json', api.call_args.args[0])

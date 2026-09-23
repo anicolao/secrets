@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import quote
 from unittest.mock import patch
 from github_secrets.cli import App, parser
-from github_secrets.common import Error, json_bytes, repo_name, run
+from github_secrets.common import Error, json_bytes, recipient, repo_name, run
 from github_secrets.config import Config
 from github_secrets.github import GitHub, Snapshot
 from github_secrets.model import MARKER, payload_value
@@ -50,11 +50,16 @@ try:
             keys = []
             for who in ('alice', 'bob'):
                 path = root / (who + '.key')
-                path.write_bytes(run(['age-keygen']))
-                path.chmod(0o600)
-                keys.append((path, run(['age-keygen', '-y', str(path)]).decode().strip()))
+                if who == 'alice':
+                    path.write_bytes(run(['age-keygen']))
+                    path.chmod(0o600)
+                    public = run(['age-keygen', '-y', str(path)]).decode().strip()
+                else:
+                    run(['ssh-keygen', '-q', '-t', 'rsa', '-b', '2048', '-N', '', '-f', str(path)])
+                    public = recipient(path.with_name(path.name + '.pub').read_text().strip())
+                keys.append((path, public))
             def use(index):
-                config.update(lambda data: data.update(identities=[{'path': str(keys[index][0]), 'type': 'age'}],
+                config.update(lambda data: data.update(identities=[{'path': str(keys[index][0]), 'type': 'age' if index == 0 else 'ssh-rsa'}],
                                                        self=None, default=repo))
                 return App(config, transport)
             def execute(app, args):
@@ -91,6 +96,6 @@ try:
             # not the default branch, so indexing/discoverability is not asserted here.
             found, errors = transport.search([keys[1][1]])
             assert not errors, errors
-            print('Live GitHub commit/read/list/removal/history/search-query checks passed.')
+            print('Live GitHub mixed age/RSA commit/read/list/removal/history/fingerprint-query checks passed.')
 finally:
     gh.api('repos/' + repo + '/git/refs/heads/' + quote(branch, safe=''), 'DELETE')

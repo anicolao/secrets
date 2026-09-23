@@ -11,6 +11,7 @@ from .config import Config
 from .crypto import Crypto, Identities
 from .github import GitHub, Snapshot
 from .inputs import dotenv, read_value
+from .common import discovery_token
 from .model import (MARKER, REMOVAL_WARNING, changed_recipients, lifecycle_status, new_payload,
                     payload_value, policy, timestamp, validate_policy)
 
@@ -28,7 +29,7 @@ def parser():
     identity = commands.add_parser('identity').add_subparsers(dest='action', required=True)
     add_identity = identity.add_parser('add')
     add_identity.add_argument('path')
-    add_identity.add_argument('--type', choices=('age', 'ssh-ed25519'), required=True)
+    add_identity.add_argument('--type', choices=('age', 'ssh-ed25519', 'ssh-rsa'), required=True)
     identity.add_parser('show')
     identity.add_parser('default').add_argument('recipient')
     create = commands.add_parser('create')
@@ -170,7 +171,8 @@ class App:
                 selected = self.identities.self_recipient()
             except Error:
                 selected = None
-            print(json.dumps({'recipients': self.identities.public, 'self': selected}, indent=2))
+            print(json.dumps({'recipients': self.identities.public, 'self': selected,
+                              'search_tokens': {key: discovery_token(key) for key in self.identities.public}}, indent=2))
         return 0
 
     def create(self, args):
@@ -200,12 +202,11 @@ class App:
         if args.command == 'add':
             require(not (args.replace and args.recipient), '--replace preserves recipients; use recipients add/remove.', 2)
         if args.command in ('add', 'import-env'):
-            for public in args.recipient:
-                recipient(public)
+            args.recipient = [recipient(public) for public in args.recipient]
             if args.generated_at:
                 timestamp(args.generated_at)
         else:
-            recipient(args.recipient)
+            args.recipient = recipient(args.recipient)
         repo = self.destination(args.vault)
         info = self.github.info(repo)
         with self.config.lock(info['id']):
