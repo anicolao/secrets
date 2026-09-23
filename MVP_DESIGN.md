@@ -2,7 +2,7 @@
 
 ## Status and decisions
 
-This is a proposed implementation contract, not documentation of existing code. The current deliverable is limited to this document, [the README](README.md), and [the vision](VISION.md).
+This document describes the implemented MVP contract and its verification criteria. See [the README](README.md) for operation and recovery and [the vision](VISION.md) for product intent.
 
 | Area | MVP decision |
 | --- | --- |
@@ -15,7 +15,7 @@ This is a proposed implementation contract, not documentation of existing code. 
 | Discovery | Search full age recipients in per-secret records; supplement with known vaults |
 | Verification | Current manifest validation followed by actual decryption |
 | Removal status | Track value generations separately from recipient removals; never equate removal with revocation |
-| Publishing | Encrypted Git commit and ordinary fast-forward push |
+| Publishing | GitHub Git database objects and a non-force branch-reference update |
 | Implementation | Small Python CLI orchestrating packaged `sops`, `age`, `ssh-to-age`, OpenSSH tools, `git`, and `gh` |
 | Platforms | Initial targets: `aarch64-darwin`, `x86_64-darwin`, `aarch64-linux`, `x86_64-linux` |
 
@@ -94,7 +94,7 @@ The strings above are schematic placeholders. Real records contain canonical ful
 
 Each secret uses its own fresh SOPS data key. Its ciphertext recipient metadata must exactly match its sibling record. Do not share data keys between secrets, even if their audiences happen to match. This separation allows different audiences in one vault and makes changing one secret independent of every other secret.
 
-There is no committed `.sops.yaml` in version 1. The wrapper passes explicit per-secret recipients and, when required for `updatekeys`, generates a temporary exact-path SOPS configuration for the target only. Ignore ambient SOPS recipient settings and inherited configuration. Reject non-age backends, threshold groups, and unencrypted payload exceptions. Recipient records are policy declarations, not proof of access or publisher authenticity; verify the paired ciphertext before reporting a readable secret.
+There is no committed `.sops.yaml` in version 1. The wrapper supplies explicit per-secret recipients with an empty SOPS configuration. Every mutation performs fresh encryption with a new data key, including recipient additions and removals. Ignore ambient SOPS recipient settings and inherited configuration. Reject non-age backends, threshold groups, and unencrypted payload exceptions. Recipient records are policy declarations, not proof of access or publisher authenticity; verify the paired ciphertext before reporting a readable secret.
 
 ### Secret names and values
 
@@ -122,7 +122,7 @@ Before SOPS encryption, each file has this logical JSON shape:
 }
 ```
 
-All payload values, including every lifecycle field, are encrypted. After decryption, validate the schema, encoding, and agreement between `name`, its directory, and its public recipient record before decoding `value`. Base64 preserves arbitrary bytes; it provides no secrecy on its own. The decrypted payload must never be written into the repository. Limit decoded values to 1 MiB, encrypted documents to 4 MiB, and vaults to 1,000 secret directories for the MVP. Fail explicitly on oversized input.
+All nonempty payload values, including lifecycle fields, are encrypted. Standard SOPS output leaves nulls, empty strings, and empty containers structurally visible; the schema validates those after decryption. After decryption, validate the schema, encoding, and agreement between `name`, its directory, and its public recipient record before decoding `value`. Base64 preserves arbitrary bytes; it provides no secrecy on its own. The decrypted payload must never be written into the repository. Limit decoded values to 1 MiB, encrypted documents to 4 MiB, and vaults to 1,000 secret directories and 128 MiB of managed files for the MVP. Fail explicitly on oversized input.
 
 Use standard SOPS output and metadata, preserving its integrity checks. SOPS protects a file's data key for the configured age recipients, allowing each corresponding identity to decrypt the same document. See [SOPS age support](https://getsops.io/docs/usage/identities/age/). The format does not duplicate the whole secret once per person.
 
@@ -136,9 +136,9 @@ Identity resolution is deterministic: explicit registered configuration takes pr
 
 Use [ssh-to-age](https://github.com/Mic92/ssh-to-age) to derive native age keys from Ed25519 SSH material. Its public conversion allows a stable `age1…` address; private conversion supports encrypted SSH keys with passphrase input via stdin. The client prompts privately when unlocking is required and passes the passphrase through a dedicated pipe, never an argument or environment variable. Unsupported key encryption formats produce an actionable error; the application never rewrites the SSH key.
 
-Derive public material from the private key when establishing a source, checking any `.pub` file against it. Cache the verified public recipient for subsequent search; do not trust an unrelated `.pub` file. Revalidate the binding when the private source changes and before decrypting. Identity selection changes never automatically rekey existing secrets. Cached public data may support discovery while a key is locked, but verified listings still require successful decryption.
+Derive public material from the private key when establishing a source, checking any `.pub` file against it. Verify the public/private binding on each invocation; do not trust an unrelated `.pub` file. The current implementation unlocks identities before searching and does not persist derived public-key caches. Identity selection changes never automatically rekey existing secrets.
 
-Derived private identities exist only during the invocation. Provide the selected identities to SOPS through a private runtime file or inherited descriptor compatible with the pinned version. If a temporary file is needed, use exclusive creation, mode `0600`, and a private runtime directory outside repositories and caches; delete it on completion or failure. It must never become a persistent exported age key. Clear ambient SOPS key sources and key-command hooks. This design does not depend on SOPS directly unlocking an SSH key or on `ssh-agent` access.
+Derived private identities exist only during the invocation. Provide selected identities through an exclusively created mode-0600 file in a private temporary directory outside repositories and caches. SOPS reopens this seekable file for different recipients. Delete it on normal completion, failures, and handled termination; a forced kill or host crash may leave it behind. It must never become a persistent exported age key. Clear ambient SOPS key sources and key-command hooks. This design does not depend on SOPS directly unlocking an SSH key or on `ssh-agent` access.
 
 Key replacement requires adding the new age recipient to each affected secret and then removing the old one. Removing an SSH key from GitHub login authorization does not revoke decryption. Retain old key backups when historical values must remain recoverable.
 
@@ -147,8 +147,8 @@ Use the existing GitHub CLI credential setup; do not store GitHub tokens in vaul
 ## Creating and publishing vaults
 
 1. Validate the name, authentication, and destination owner. Do not adopt an existing repository under `create`.
-2. Build the root format marker and explanatory README in an isolated staging directory. It contains no secrets or private keys.
-3. Create the GitHub repository with the requested visibility and publish its initial commit.
+2. Prepare the root format marker and explanatory README in memory. It contains no secrets or private keys.
+3. Create the GitHub repository with the requested visibility and an initial README commit, then publish the vault marker and explanatory README via the Git database API.
 4. Register its repository ID/name and choose it as default only after publication succeeds.
 5. Print its URL, visibility, and commit. If creation succeeds but publication fails, report the empty remote and recovery information; do not delete it automatically or claim success.
 
@@ -157,23 +157,23 @@ A vault is usable before it has secrets. It has no addressed secrets yet and can
 ## Secret write transaction
 
 1. Resolve the explicit/default vault and take a local per-repository lock. Refuse to start while an unresolved transaction exists.
-2. Fetch the current default-branch revision into an isolated managed repository. Validate the root marker, safe paths, and the target secret’s recipient record and ciphertext. For replacements, decrypt and validate the target. Never require decryption of unrelated secrets; their different audiences are expected.
+2. Fetch the current default-branch revision and bounded Git tree/blob data through GitHub APIs without a checkout. Validate the root marker, safe paths, and the target secret’s recipient record and ciphertext. For replacements, decrypt and validate the target. Never require decryption of unrelated secrets; their different audiences are expected.
 3. Record the base commit and target policy digest (or target absence for creation). Validate the secret name and replacement rule before asking for a value.
 4. Read the value, construct its inner payload in memory, and feed it to SOPS through stdin using the target’s explicit recipient list. Create a new data key for each new secret. Update the encrypted lifecycle metadata according to the generation rules below in the same transaction. Capture only encrypted output on disk.
 5. Decrypt the new document into memory, validate its payload, and compare the recovered bytes with the input. Reject any mismatch or failed integrity check.
-6. Stage only the target’s ciphertext and its recipient record as one atomic change, never `git add .`. Inspect the staged path set and format before creating a generic commit message without a secret value.
-7. Push normally to the recorded branch. A concurrent update must cause rejection; never force push, automatically merge encrypted JSON, or silently replay a write under a changed recipient policy.
-8. Report success only after confirming the remote revision. On failure preserve ciphertext and the base revision as pending local state, report its location and a manual recovery path, and exit nonzero. Retrying requires refreshing and reviewing the remote state. Plaintext is not retained for retry.
+6. Upload only the target’s ciphertext and recipient record as Git blobs; build a tree against the fetched base tree and a single commit with that base as its parent. Use a generic commit message without a secret value.
+7. Update the recorded branch reference through GitHub with `force: false`. A divergent concurrent update must cause rejection; never force an update, automatically merge encrypted JSON, or silently replay a write under a changed recipient policy.
+8. Report success only after confirming the remote revision. Before creating remote objects, save ciphertext and the base revision as pending local state; record the proposed commit before updating the reference. On failure retain this state, report its location and a manual recovery path, and exit nonzero. Retrying requires refreshing and reviewing the remote state. Plaintext is not retained for retry.
 
 If a network failure makes the push outcome ambiguous, fetch the remote to determine whether the commit landed. If that check also fails, report an unknown publication state. Branch protection failures are normal operational failures; PR-based writes are out of scope.
 
-Remote repositories are untrusted data. Disable hooks and external Git filters, do not fetch submodules or LFS content, and reject symlinks and unexpected file types in managed paths. Use argument arrays without a shell, constrain remotes to the intended GitHub host/repository, and bound reads before parsing. Reading a vault must not execute files from it.
+Remote repositories are untrusted data. Read only Git API tree/blob data, never a working checkout; hooks, external filters, submodules, and LFS downloads are not invoked. Reject symlinks and unexpected file types in managed paths. Use argument arrays without a shell, constrain remotes to the intended GitHub host/repository, and bound reads before parsing. Reading a vault must not execute files from it.
 
 ## Recipient changes
 
 Every recipient command takes a secret name. Listing recipients reads public policy and requires only repository read access. Adding or removing recipients requires an acting identity that decrypts that secret and GitHub write permission. Show its old and proposed recipient sets. Refuse removal of the final recipient and removal of the acting recipient in the MVP; a different authorized writer can complete that person’s removal. These restrictions apply only to the target secret.
 
-For addition, update that secret’s recipient record and its SOPS recipient wrapping. For removal, update its recipients first and then rotate its data key. SOPS distinguishes recipient updates from data-key rotation; see [SOPS key management](https://getsops.io/docs/usage/key-management/). Use target-specific temporary configuration; never process the vault as a sharing group.
+For additions and removals, update the target’s recipient record and freshly encrypt its unchanged value and updated lifecycle using only the resulting recipients. This creates a fresh SOPS data key on every mutation, avoiding reuse of a key known to a removed recipient. The generation of the secret value remains unchanged. This is a simpler equivalent to updating recipient wrapping and rotating the data key; see [SOPS key management](https://getsops.io/docs/usage/key-management/). No other secret is processed.
 
 On removal, append the encrypted removal event described below before verifying the target. Verify exact agreement of the record and ciphertext and confirm the secret value bytes and generation metadata are unchanged; lifecycle removal metadata is the intended payload change. Commit and push the pair together. On failure publish neither. Other secrets remain byte-for-byte unchanged, and inability to decrypt them is expected rather than an error. A mismatch on the target blocks the operation and is reported without silently repairing its policy.
 
@@ -254,7 +254,7 @@ By default, reads refresh the remote. `--offline` is an explicit choice to use c
 
 ## Nix packaging and implementation structure
 
-The future flake pins `nixpkgs` in `flake.lock`, exposes `packages.<system>.default` and `apps.<system>.default`, and offers a development shell and checks. Package the Python entry point with fixed paths to the required runtime binaries. The app must run from an arbitrary working directory; vault resolution comes from explicit arguments and local configuration.
+The flake pins `nixpkgs` in `flake.lock`, exposes `packages.<system>.default` and `apps.<system>.default`, and offers a development shell and checks. Package the Python entry point with fixed paths to the required runtime binaries. The app must run from an arbitrary working directory; vault resolution comes from explicit arguments and local configuration.
 
 Separate modules for CLI parsing, local configuration, GitHub discovery, vault schema validation, SOPS execution, and Git transactions keep external tools mockable. Use the standard library for the version-1 JSON schemas. There is no background daemon, remote database, or custom cryptography.
 
@@ -279,7 +279,7 @@ Encryption integrity does not establish author identity or prevent GitHub from s
 
 ## Acceptance criteria and implementation sequence
 
-Implement only after this documentation stage. Use throwaway keys and fake values in every automated test.
+Use throwaway keys and fake values in every automated test. The suite exercises real local cryptographic tools and simulated GitHub state; the opt-in live smoke test uses an isolated non-default branch, so default-branch indexing and private-repository access remain separate deployment checks.
 
 1. **Format and local round trip:** validate manifests and names; encrypt/decrypt exact bytes including empty, multiline, binary, and maximum-size inputs. Confirm independent stock SOPS recovery and rejection of a nonrecipient identity.
 2. **CLI and packaging:** build on the target systems; exercise automatic SSH identity selection, alternate paths, native age sources, encrypted SSH keys, missing keys, unsupported types, stale `.pub` files, and repeatable public/private conversion. Confirm no persistent derived private key or build-time secret. Reject positional values, value flags, conflicting input modes, and noninteractive prompts without echoing rejected tokens or touching the network.
@@ -290,4 +290,4 @@ Implement only after this documentation stage. Use throwaway keys and fake value
 7. **Removal lifecycle:** test distinct generation/recording/removal times, unchanged replacements, imported old values, user-asserted freshness, equal/skewed clocks, missing/tampered metadata, multiple removals, re-addition, and subsequent removal. Verify data-key rotation alone never changes generation metadata or resolves a warning. Test warning output before removal and after publication, including quiet/noninteractive use, and failed or ambiguous pushes. Assert atomic lifecycle/ciphertext updates and that stdout from `get` remains exact.
 8. **End-to-end release check:** using disposable GitHub vaults, two identities, and distinct hosting permissions, demonstrate direct search by an SSH-derived age recipient finds the correct individual public secrets across mixed-audience vaults; private retrieval still requires GitHub access. Include a secret whose ciphertext exceeds the code-search size limit but whose recipient record is searchable. Document indexing delays and the pinned tool versions used.
 
-The MVP is complete when users can create a vault, publish and retrieve a secret, share it, discover it from another identity, and understand partial results and revocation limits. Implementation is not part of the current task.
+The MVP is complete when users can create a vault, publish and retrieve a secret, share it, discover it from another identity, and understand partial results and revocation limits. The implementation and tests are included in this repository.

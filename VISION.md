@@ -120,4 +120,4 @@ Possible later work includes stronger publisher verification, richer key migrati
 - Users can explain where their private key lives, what metadata is visible, and why removing a recipient cannot retract old secrets.
 - A vault remains recoverable with Git, SOPS, and the documented payload schema if this application is unavailable.
 
-The [MVP design](MVP_DESIGN.md) turns these goals into an implementable first version. This document describes intent; no implementation is included at this stage.
+The [MVP design](MVP_DESIGN.md) turns these goals into an implementable first version. This document describes product intent; the repository now includes the first implementation and its tests.
