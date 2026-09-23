@@ -6,7 +6,7 @@ Make small-scale secret sharing feel like publishing and reading ordinary Git re
 
 The building blocks have distinct jobs: Nix distributes a reproducible command environment; SOPS stores encrypted values; age supplies encryption recipients and local identities; Git records changes; GitHub hosts repositories and provides discovery. This project supplies the conventions and workflow connecting them.
 
-The intended audience is individuals and small technical teams already comfortable with GitHub and already holding an Ed25519 SSH private key. The project prioritizes an understandable file format and a small command surface over enterprise administration.
+The intended audience is individuals and small technical teams already comfortable with GitHub and already holding an Ed25519 or RSA SSH private key. The project prioritizes an understandable file format and a small command surface over enterprise administration.
 
 ## The experience we want
 
@@ -28,7 +28,7 @@ An entry import identifies the destination vault, selected entry names, and inte
 
 ### Share through a public key
 
-Alice obtains Bob’s SSH-derived or native public age recipient through a channel she trusts and adds it to a particular secret. The application makes that secret readable by Bob and preserves its recipient list on replacement. Adding a different secret starts with its own explicit audience. Bob's GitHub username is useful context, but the public key is the encryption address.
+Alice obtains Bob’s SSH-derived age address, RSA public key, or native public age recipient through a channel she trusts and adds it to a particular secret. The application makes that secret readable by Bob and preserves its recipient list on replacement. Adding a different secret starts with its own explicit audience. Bob's GitHub username is useful context, but the public key is the encryption address.
 
 For a public vault, Bob does not need a GitHub repository invitation to fetch ciphertext. For a private vault, Alice also arranges GitHub read access. Encryption access and hosting access are separate requirements. Giving Bob an age recipient entry never implicitly gives him GitHub write permission.
 
@@ -36,13 +36,13 @@ Per-secret recipients are fundamental from the first version. Alice can keep a p
 
 ### Find what has been shared
 
-Bob asks for `secrets list`; the application searches GitHub for his complete age recipient in small per-secret recipient records, then verifies and decrypts matching secrets. `vaults list` groups those matches by repository. Bob can also paste the age address from `identity show` into GitHub code search to locate the same records. Search is the entry point; inspection and decryption supply the evidence.
+Bob asks for `secrets list`; the application searches GitHub for his complete native age recipient or RSA fingerprint token in small per-secret recipient records, then verifies and decrypts matching secrets. `vaults list` groups those matches by repository. Bob can also paste the public search token from `identity show` into GitHub code search to locate the same records. Search is the entry point; inspection and decryption supply the evidence.
 
 The experience should distinguish an empty vault, an inaccessible repository, a corrupt file, and an incomplete search. Absence from search is never evidence that no vault exists. Direct repository registration supports private teams, new vaults, and any repository that search misses.
 
 ### Move between machines without changing the model
 
-On another machine, Bob installs Nix, authenticates to GitHub, and restores his identity from his own backup. His default Ed25519 SSH key supplies the identity automatically; other key paths and native age identities can be registered explicitly. He discovers secrets or explicitly registers vaults. He does not need a project-operated account or database export.
+On another machine, Bob installs Nix, authenticates to GitHub, and restores his identity from his own backup. His default Ed25519 SSH key, or RSA key when Ed25519 is absent, supplies the identity automatically; other key paths and native age identities can be registered explicitly. He discovers secrets or explicitly registers vaults. He does not need a project-operated account or database export.
 
 Local defaults and registrations are conveniences. The repositories and identities are the durable assets. Multiple registered identity files allow a transition between old and new keys, while one selected recipient is included when creating a secret. No key is needed merely to define an empty repository container.
 
@@ -50,7 +50,7 @@ Local defaults and registrations are conveniences. The repositories and identiti
 
 ### Reuse the user’s SSH identity
 
-The default is the existing Ed25519 SSH key at `~/.ssh/id_ed25519`. Derive a stable native age address for sharing and search, and derive its private counterpart only while decrypting. A separate age key should not be a prerequisite. An explicit identity selection supports other file locations and native age keys. Unsupported SSH types must fail clearly rather than silently selecting or generating a different identity.
+Prefer the existing Ed25519 SSH key at `~/.ssh/id_ed25519`, falling back to `~/.ssh/id_rsa` only when it is absent. For Ed25519, derive a stable native age address for sharing and search. For RSA, use the full SSH public key for encryption and a deterministic SHA-256 fingerprint token for search. Derive or unlock private material only at runtime. A separate age key should not be a prerequisite. An explicit identity selection supports other file locations and native age keys. Unsupported SSH types must fail clearly rather than silently selecting or generating a different identity.
 
 The SSH key and its derived age identity share a lifecycle: changing SSH login authorization does not revoke decryption, and deleting the old private key can lose access to historical secrets. Key migration must update each relevant secret, with no implicit vault-wide grant.
 
@@ -60,7 +60,7 @@ A vault should remain an ordinary repository of standard SOPS files. A technical
 
 ### Make the recipient policy explicit
 
-Each secret has a small `recipients.json` containing complete public age recipient strings. These are its sharing policy and searchable addresses. The application checks that the paired ciphertext’s recipients agree with that record before publishing either. Keeping the record separate allows discovery even for larger encrypted values. The root vault manifest only identifies the format.
+Each secret has a small `recipients.json` containing complete public recipient strings. These define its sharing policy; RSA records also contain compact, verifiable search tokens because full RSA keys exceed GitHub query limits. Search tokens never substitute for full-key matching and successful decryption. The application checks that the paired ciphertext’s recipients agree with that record before publishing either. Keeping the record separate allows discovery even for larger encrypted values. The root vault manifest only identifies the format.
 
 A recipient record cannot itself force access restrictions: ciphertext determines what can be decrypted, and a writer could use other tools to violate the convention. The application therefore validates policy consistency and treats decryption success separately from policy declarations. Repository write access is a position of trust.
 
@@ -100,7 +100,7 @@ There is no recovery authority. A person who loses all authorized private keys l
 
 ## Initial scope and deliberate exclusions
 
-The first useful version provides vault creation, local defaults, secret addition and replacement, environment-variable input, `.env` entry import, retrieval, recipient changes, explicit registration, and discovery-backed listings. It supports GitHub.com, per-secret recipient lists, and native classic age recipients derived by default from `~/.ssh/id_ed25519`, with interoperable SOPS files and no service to deploy. Native age identity files remain an explicit alternative.
+The first useful version provides vault creation, local defaults, secret addition and replacement, environment-variable input, `.env` entry import, retrieval, recipient changes, explicit registration, and discovery-backed listings. It supports GitHub.com, per-secret recipient lists, and native classic age recipients derived by default from `~/.ssh/id_ed25519`, with interoperable SOPS files and no service to deploy. RSA SSH keys are also supported from the start, using direct SSH recipients and fingerprint discovery. Native age identity files remain an explicit alternative.
 
 It excludes key escrow, hardware integrations, browser extensions, dynamic credentials, scheduled rotation, deployment injection, GitHub organization administration, and pull-request publication workflows. These features introduce separate policy or operational concerns. The initial implementation should establish reliable storage and retrieval first.
 
@@ -110,7 +110,7 @@ Possible later work includes stronger publisher verification, richer key migrati
 
 - A new user can create a vault, add a value, and read it back without manually editing encryption configuration.
 - Users can import existing environment variables and `.env` entries without putting values in command-line arguments, executing file contents, or unintentionally changing existing secrets’ recipients.
-- A second user can discover individual public secrets by searching their age recipient, without receiving a repository URL, and decrypt exactly the secrets addressed to them.
+- A second user can discover individual public secrets by searching their age address or RSA fingerprint token, without receiving a repository URL, and decrypt exactly the secrets addressed to them.
 - Two secrets in one vault can have different audiences; changing one secret’s recipients never changes the other’s accessibility.
 - The default SSH identity works without generating or permanently storing a separate private key.
 - The same workflow works for private vaults when repository access is granted, with explicit registration available whenever discovery misses them.
@@ -120,4 +120,4 @@ Possible later work includes stronger publisher verification, richer key migrati
 - Users can explain where their private key lives, what metadata is visible, and why removing a recipient cannot retract old secrets.
 - A vault remains recoverable with Git, SOPS, and the documented payload schema if this application is unavailable.
 
-The [MVP design](MVP_DESIGN.md) turns these goals into an implementable first version. This document describes intent; no implementation is included at this stage.
+The [MVP design](MVP_DESIGN.md) turns these goals into an implementable first version. This document describes product intent; the repository now includes the first implementation and its tests.
